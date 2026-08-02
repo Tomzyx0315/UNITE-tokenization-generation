@@ -10,6 +10,7 @@ reconstruction loss is used in this first experimental scaffold.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import time
@@ -17,6 +18,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -25,6 +27,7 @@ from torch.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision.utils import save_image
 
+from engines.eval import evaluate_fid
 from models.unite import UNITE
 from utils.distributed import cleanup_distributed, is_main_process, setup_distributed
 from utils.ema import update_ema
@@ -104,7 +107,7 @@ def group_advantages(
     clip: float | None,
     max_abs: float | None,
 ) -> torch.Tensor:
-    grouped = rewards.float().view(num_groups, samples_per_group)
+    grouped = rewards.detach().float().view(num_groups, samples_per_group)
     if samples_per_group > 1:
         adv = (grouped - grouped.mean(dim=1, keepdim=True)) / (
             grouped.std(dim=1, keepdim=True, unbiased=False) + eps
@@ -335,6 +338,236 @@ def save_sample_grid(
     return path
 
 
+@torch.no_grad()
+def rollout_policy_batch(
+    policy: UNITE,
+    reward_model: DINOv2ImageNetReward,
+    *,
+    labels: torch.Tensor,
+    reward_scale: float,
+    rollout_micro_batch_size: int,
+    device: torch.device,
+    device_type: str,
+    autocast_kwargs: Dict[str, Any],
+    cfg_scale: float,
+    cfg_interval: Tuple[float, float],
+    cfg_norm_order: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    z_chunks, reward_chunks = [], []
+    batch = labels.shape[0]
+    rollout_micro_batch_size = batch if rollout_micro_batch_size <= 0 else rollout_micro_batch_size
+
+    for start in range(0, batch, rollout_micro_batch_size):
+        end = min(start + rollout_micro_batch_size, batch)
+        y = labels[start:end]
+        with autocast(device_type, **autocast_kwargs):
+            images, _labels_np, z_clean = policy.diffusion_generate(
+                device=device,
+                num_visuals=y.shape[0],
+                cfg_scale=cfg_scale,
+                cfg_interval=cfg_interval,
+                cfg_norm_order=cfg_norm_order,
+                y_given=y,
+                return_z=True,
+            )
+        rewards = reward_model(images, y) * reward_scale
+        z_chunks.append(z_clean.detach())
+        reward_chunks.append(rewards.detach())
+        del images, z_clean, rewards
+
+    return torch.cat(z_chunks, dim=0), torch.cat(reward_chunks, dim=0)
+
+
+def split_loss_indices(num_items: int, num_chunks: int, device: torch.device) -> list[torch.Tensor]:
+    if num_items <= 0:
+        raise ValueError("Cannot split an empty rollout batch.")
+    num_chunks = min(max(int(num_chunks), 1), num_items)
+    return list(torch.arange(num_items, device=device).chunk(num_chunks))
+
+
+def _as_float_list(value: Any, fallback: float) -> list[float]:
+    if value is None:
+        value = [fallback]
+    elif isinstance(value, (int, float)):
+        value = [value]
+    return [float(x) for x in value]
+
+
+def _as_interval_list(value: Any, fallback: Tuple[float, float]) -> list[Tuple[float, float]]:
+    if value is None:
+        value = [fallback]
+    elif (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(isinstance(x, (int, float)) for x in value)
+    ):
+        value = [value]
+
+    intervals = []
+    for interval in value:
+        if len(interval) != 2:
+            raise ValueError(f"Eval CFG interval must have length 2, got {interval}.")
+        intervals.append((float(interval[0]), float(interval[1])))
+    return intervals
+
+
+def _as_str_list(value: Any, fallback: str) -> list[str]:
+    if value is None:
+        value = [fallback]
+    elif isinstance(value, str):
+        value = [value]
+    return [str(x) for x in value]
+
+
+def _contains_tensor_state_dict(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(torch.is_tensor(item) for item in value.values())
+
+
+def validate_inception_weights(path: str) -> None:
+    try:
+        try:
+            weights = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            weights = torch.load(path, map_location="cpu")
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load INCEPTION_WEIGHTS with torch.load: {path}") from exc
+
+    valid = _contains_tensor_state_dict(weights)
+    if not valid and isinstance(weights, dict):
+        valid = any(_contains_tensor_state_dict(item) for item in weights.values())
+    if not valid:
+        kind = type(weights).__name__
+        keys = list(weights.keys())[:10] if isinstance(weights, dict) else None
+        raise RuntimeError(
+            "INCEPTION_WEIGHTS must be a torch checkpoint containing a tensor state_dict; "
+            f"got type={kind}, keys={keys} from {path}"
+        )
+
+
+def validate_checkpoint_eval_config(eval_cfg: Dict[str, Any]) -> None:
+    if not bool(eval_cfg.get("enabled", False)):
+        return
+    required = ("INCEPTION_WEIGHTS", "IN256_FID_STATS")
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError(
+            "Checkpoint FID evaluation is enabled, but these environment variables are missing: "
+            f"{', '.join(missing)}. Set them or disable eval.enabled."
+        )
+    for name in required:
+        path = os.environ[name]
+        if not os.path.isfile(path):
+            raise RuntimeError(
+                f"Checkpoint FID evaluation is enabled, but {name} does not point to a file: {path}"
+            )
+
+    validate_inception_weights(os.environ["INCEPTION_WEIGHTS"])
+
+    stats_path = os.environ["IN256_FID_STATS"]
+    try:
+        with np.load(stats_path) as stats:
+            keys = set(stats.files)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read IN256_FID_STATS as an .npz file: {stats_path}") from exc
+    if not {"mu", "sigma"}.issubset(keys):
+        raise RuntimeError(
+            f"IN256_FID_STATS must contain 'mu' and 'sigma' arrays, got keys={sorted(keys)}"
+        )
+
+
+def run_checkpoint_eval(
+    *,
+    ema_policy: UNITE,
+    reward_model: DINOv2ImageNetReward,
+    eval_cfg: Dict[str, Any],
+    sample_cfg: Dict[str, Any],
+    device: torch.device,
+    global_step: int,
+    eval_dir: str,
+    log: logging.Logger,
+    autocast_kwargs: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    if not bool(eval_cfg.get("enabled", False)):
+        return None
+
+    cfg_scales = _as_float_list(eval_cfg.get("cfg_scales"), float(sample_cfg.get("cfg_scale", 1.0)))
+    cfg_intervals = _as_interval_list(
+        eval_cfg.get("cfg_intervals"),
+        tuple(float(x) for x in sample_cfg.get("cfg_interval", (0.1, 1.0))),
+    )
+    cfg_norm_orders = _as_str_list(
+        eval_cfg.get("cfg_norm_orders"),
+        str(sample_cfg.get("cfg_norm_order", "norm_first")),
+    )
+    num_images = int(eval_cfg.get("num_images", 50000))
+    num_classes = int(eval_cfg.get("num_classes", ema_policy.num_classes))
+    image_size = int(eval_cfg.get("image_size", 256))
+    batch_size = int(eval_cfg.get("batch_size", 50))
+    offload_reward = bool(eval_cfg.get("offload_reward_model", True))
+
+    if is_main_process():
+        log.info(
+            f"[Eval] Starting checkpoint eval at step {global_step}: "
+            f"num_images={num_images}, batch_size={batch_size}, cfg_scales={cfg_scales}, "
+            f"cfg_intervals={cfg_intervals}, cfg_norm_orders={cfg_norm_orders}"
+        )
+
+    if offload_reward and device.type == "cuda":
+        reward_model.to(torch.device("cpu"))
+        torch.cuda.empty_cache()
+    if dist.is_initialized():
+        dist.barrier()
+
+    eval_start = time.time()
+    try:
+        ema_policy.eval()
+        best_cfg, fid, is_score = evaluate_fid(
+            ema_policy,
+            device=device,
+            global_step=global_step,
+            image_size=image_size,
+            cfg_scales=cfg_scales,
+            cfg_intervals=cfg_intervals,
+            cfg_norm_orders=cfg_norm_orders,
+            num_images=num_images,
+            num_classes=num_classes,
+            batch_size=batch_size,
+            log_to_wandb=False,
+            log_fid_best=False,
+            current_best_cfg_scale=cfg_scales[0],
+            return_metrics=True,
+            autocast_kwargs=autocast_kwargs,
+        )
+    finally:
+        if dist.is_initialized():
+            dist.barrier()
+        if offload_reward and device.type == "cuda":
+            reward_model.to(device)
+            torch.cuda.empty_cache()
+
+    metrics = {
+        "step": int(global_step),
+        "eval/fid50k": float(fid),
+        "eval/is50k": float(is_score),
+        "eval/best_cfg_scale": float(best_cfg),
+        "eval/num_images": num_images,
+        "eval/batch_size": batch_size,
+        "eval/sec": time.time() - eval_start,
+    }
+    if is_main_process():
+        os.makedirs(eval_dir, exist_ok=True)
+        metrics_path = os.path.join(eval_dir, "metrics.jsonl")
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps(metrics, sort_keys=True) + "\n")
+        log.info(
+            f"[Eval] step={global_step}, FID-50K={fid:.4f}, IS-50K={is_score:.4f}, "
+            f"best_cfg={best_cfg:.2f}, metrics={metrics_path}"
+        )
+    return metrics
+
+
 def main() -> None:
     args = parse_args()
     rank, world_size, device = setup_distributed()
@@ -347,6 +580,8 @@ def main() -> None:
     awm_cfg = dict(full_cfg.get("awm", {}))
     reward_cfg = dict(full_cfg.get("reward", {}))
     sample_cfg = dict(full_cfg.get("sampling", {}))
+    eval_cfg = dict(full_cfg.get("eval", {}))
+    validate_checkpoint_eval_config(eval_cfg)
 
     seed = int(training_cfg.get("global_seed", 0)) * world_size + rank
     torch.manual_seed(seed)
@@ -356,12 +591,15 @@ def main() -> None:
         experiment_dir = os.path.join(args.results_dir, args.experiment_name)
         checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
         sample_dir = os.path.join(experiment_dir, "samples")
+        eval_dir = os.path.join(experiment_dir, "eval")
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(sample_dir, exist_ok=True)
+        os.makedirs(eval_dir, exist_ok=True)
         log = create_logger(experiment_dir)
         log.info(f"Experiment directory created at {experiment_dir}")
     else:
         checkpoint_dir = os.path.join(args.results_dir, args.experiment_name, "checkpoints")
+        eval_dir = os.path.join(args.results_dir, args.experiment_name, "eval")
         sample_dir = None
         log = create_logger(None)
 
@@ -427,17 +665,26 @@ def main() -> None:
 
     max_train_steps = int(training_cfg.get("max_train_steps", 10000))
     grad_accum_steps = int(training_cfg.get("gradient_accumulation_steps", 1))
+    if grad_accum_steps <= 0:
+        raise ValueError("training.gradient_accumulation_steps must be positive.")
     log_interval = int(training_cfg.get("log_interval", 10))
     checkpoint_interval = int(training_cfg.get("checkpoint_interval", 1000))
     clip_grad = float(training_cfg.get("clip_grad", 1.0))
     ema_decay = float(training_cfg.get("ema_decay", 0.999))
     num_groups = int(awm_cfg.get("classes_per_rank", 4))
     samples_per_group = int(awm_cfg.get("samples_per_class", 4))
+    local_rollout_batch = num_groups * samples_per_group
+    rollout_micro_batch_size = int(awm_cfg.get("rollout_micro_batch_size", local_rollout_batch))
     advantage_eps = float(awm_cfg.get("advantage_eps", 1e-4))
     advantage_clip = awm_cfg.get("advantage_clip", 5.0)
     advantage_clip = None if advantage_clip is None else float(advantage_clip)
     advantage_max = awm_cfg.get("advantage_max", 1.0)
     advantage_max = None if advantage_max is None else float(advantage_max)
+    if num_groups <= 0 or samples_per_group <= 0:
+        raise ValueError("awm.classes_per_rank and awm.samples_per_class must be positive.")
+    if local_rollout_batch <= 0:
+        raise ValueError("Local rollout batch must be positive.")
+    reward_scale = float(reward_cfg.get("scale", 1.0))
 
     cfg_interval = tuple(float(x) for x in sample_cfg.get("cfg_interval", (0.1, 1.0)))
     cfg_scale = float(sample_cfg.get("cfg_scale", 1.0))
@@ -447,6 +694,7 @@ def main() -> None:
     device_type = "cuda" if device.type == "cuda" else "cpu"
     raw_module = ddp_model.module if hasattr(ddp_model, "module") else ddp_model
     global_step = 0
+    last_eval_step = None
 
     grid_labels = grid_noise = None
     grid_nrow = 0
@@ -476,60 +724,63 @@ def main() -> None:
         trainable = sum(p.numel() for p in params)
         log.info(
             f"Starting UNITE-AWM: steps={max_train_steps}, world_size={world_size}, "
-            f"local_rollout_batch={num_groups * samples_per_group}, trainable={trainable / 1e6:.2f}M"
+            f"local_rollout_batch={local_rollout_batch}, "
+            f"rollout_micro_batch={rollout_micro_batch_size}, "
+            f"denoise_accum_steps={grad_accum_steps}, advantage_group_size={samples_per_group}, "
+            f"trainable={trainable / 1e6:.2f}M"
         )
 
     while global_step < max_train_steps:
         step_start = time.time()
         optimizer.zero_grad(set_to_none=True)
         metric_sums: Dict[str, torch.Tensor] = {}
-        reward_sum = torch.zeros((), device=device)
+        labels, _group_labels = sample_grouped_labels(
+            num_groups=num_groups,
+            samples_per_group=samples_per_group,
+            num_classes=raw_module.policy.num_classes,
+            device=device,
+        )
 
-        for accum_idx in range(grad_accum_steps):
-            labels, _group_labels = sample_grouped_labels(
-                num_groups=num_groups,
-                samples_per_group=samples_per_group,
-                num_classes=raw_module.policy.num_classes,
-                device=device,
-            )
+        raw_module.policy.eval()
+        z_clean, rewards = rollout_policy_batch(
+            raw_module.policy,
+            reward_model,
+            labels=labels,
+            reward_scale=reward_scale,
+            rollout_micro_batch_size=rollout_micro_batch_size,
+            device=device,
+            device_type=device_type,
+            autocast_kwargs=autocast_kwargs,
+            cfg_scale=cfg_scale,
+            cfg_interval=cfg_interval,
+            cfg_norm_order=cfg_norm_order,
+        )
+        advantages = group_advantages(
+            rewards,
+            num_groups=num_groups,
+            samples_per_group=samples_per_group,
+            eps=advantage_eps,
+            clip=advantage_clip,
+            max_abs=advantage_max,
+        )
 
-            raw_module.policy.eval()
-            with torch.no_grad(), autocast(device_type, **autocast_kwargs):
-                images, _labels_np, z_clean = raw_module.policy.diffusion_generate(
-                    device=device,
-                    num_visuals=labels.shape[0],
-                    cfg_scale=cfg_scale,
-                    cfg_interval=cfg_interval,
-                    cfg_norm_order=cfg_norm_order,
-                    y_given=labels,
-                    return_z=True,
-                )
-
-            rewards = reward_model(images, labels) * float(reward_cfg.get("scale", 1.0))
-            advantages = group_advantages(
-                rewards,
-                num_groups=num_groups,
-                samples_per_group=samples_per_group,
-                eps=advantage_eps,
-                clip=advantage_clip,
-                max_abs=advantage_max,
-            )
-
-            raw_module.policy.train()
+        raw_module.policy.train()
+        loss_chunks = split_loss_indices(labels.shape[0], grad_accum_steps, device)
+        for accum_idx, idx in enumerate(loss_chunks):
+            weight = idx.numel() / labels.shape[0]
             sync_context = (
                 ddp_model.no_sync()
-                if hasattr(ddp_model, "no_sync") and accum_idx < grad_accum_steps - 1
+                if hasattr(ddp_model, "no_sync") and accum_idx < len(loss_chunks) - 1
                 else torch.enable_grad()
             )
             with sync_context:
                 with autocast(device_type, **autocast_kwargs):
-                    loss, metrics = ddp_model(z_clean, labels, advantages)
-                    loss = loss / grad_accum_steps
+                    loss, metrics = ddp_model(z_clean[idx], labels[idx], advantages[idx])
+                    loss = loss * weight
                 loss.backward()
 
-            reward_sum = reward_sum + rewards.detach().mean()
             for key, value in metrics.items():
-                metric_sums[key] = metric_sums.get(key, torch.zeros_like(value)) + value
+                metric_sums[key] = metric_sums.get(key, torch.zeros_like(value)) + value * weight
 
         if clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(params, clip_grad)
@@ -565,34 +816,49 @@ def main() -> None:
             logger.info(f"[Sample Grid] Saved: {grid_path}")
 
         if is_main_process() and global_step % log_interval == 0:
-            log_stats = {
-                key: (value / grad_accum_steps).item()
-                for key, value in metric_sums.items()
-            }
-            log_stats["reward/mean"] = (reward_sum / grad_accum_steps).item()
+            log_stats = {key: value.item() for key, value in metric_sums.items()}
+            log_stats["reward/mean"] = rewards.detach().mean().item()
+            log_stats["awm/local_rollout_batch"] = float(local_rollout_batch)
+            log_stats["awm/loss_microbatches"] = float(len(loss_chunks))
             log_stats["perf/step_sec"] = time.time() - step_start
             logger.info(
                 f"[Step {global_step}] "
                 + ", ".join(f"{k}: {v:.4f}" for k, v in log_stats.items())
             )
 
-        if (
+        is_checkpoint_step = (
             checkpoint_interval > 0
-            and global_step > 0
-            and global_step % checkpoint_interval == 0
-            and is_main_process()
-        ):
-            ckpt_path = f"{checkpoint_dir}/{global_step:07d}.pt"
-            save_awm_checkpoint(
-                ckpt_path,
-                step=global_step,
-                awm_model=ddp_model,
+            and completed_step > 0
+            and completed_step % checkpoint_interval == 0
+        )
+        if is_checkpoint_step:
+            if is_main_process():
+                ckpt_path = f"{checkpoint_dir}/{completed_step:07d}.pt"
+                save_awm_checkpoint(
+                    ckpt_path,
+                    step=completed_step,
+                    awm_model=ddp_model,
+                    ema_policy=ema_policy,
+                    kl_ema_policy=kl_ema_policy,
+                    optimizer=optimizer,
+                    cfg_scale=cfg_scale,
+                )
+                logger.info(f"[Checkpoint] Saved: {ckpt_path}")
+            if dist.is_initialized():
+                dist.barrier()
+            run_checkpoint_eval(
                 ema_policy=ema_policy,
-                kl_ema_policy=kl_ema_policy,
-                optimizer=optimizer,
-                cfg_scale=cfg_scale,
+                reward_model=reward_model,
+                eval_cfg=eval_cfg,
+                sample_cfg=sample_cfg,
+                device=device,
+                global_step=completed_step,
+                eval_dir=eval_dir,
+                log=logger,
+                autocast_kwargs=autocast_kwargs,
             )
-            logger.info(f"[Checkpoint] Saved: {ckpt_path}")
+            last_eval_step = completed_step
+            raw_module.policy.train()
 
         global_step += 1
 
@@ -608,6 +874,20 @@ def main() -> None:
             cfg_scale=cfg_scale,
         )
         logger.info(f"[Checkpoint] Saved final: {final_path}")
+    if dist.is_initialized():
+        dist.barrier()
+    if last_eval_step != global_step:
+        run_checkpoint_eval(
+            ema_policy=ema_policy,
+            reward_model=reward_model,
+            eval_cfg=eval_cfg,
+            sample_cfg=sample_cfg,
+            device=device,
+            global_step=global_step,
+            eval_dir=eval_dir,
+            log=logger,
+            autocast_kwargs=autocast_kwargs,
+        )
 
     cleanup_distributed()
 

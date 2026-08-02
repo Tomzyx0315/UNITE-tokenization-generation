@@ -113,18 +113,22 @@ The default config uses:
 
 | Field | Default | Description |
 |:------|:-------:|:------------|
-| `awm.classes_per_rank` | 4 | Number of ImageNet classes sampled per GPU per rollout |
-| `awm.samples_per_class` | 4 | Images sampled per class label; this is the advantage group size |
+| `training.gradient_accumulation_steps` | 4 | Number of denoising/AWM loss microbatches per rollout |
+| `awm.classes_per_rank` | 8 | Number of ImageNet classes sampled per GPU per rollout |
+| `awm.samples_per_class` | 8 | Images sampled per class label; this is the per-rank advantage group size |
+| `awm.rollout_micro_batch_size` | 16 | No-grad rollout/reward microbatch size used before the denoising loss accumulation |
 | `awm.train_timesteps` | 4 | Number of random flow timesteps trained per generated latent |
 | `awm.beta_kl` | 0.05 | Velocity-space KL coefficient to the frozen pretrained UNITE reference |
 | `awm.ema_beta` | 1.0 | Velocity-space KL coefficient to the adaptive EMA reference |
 | `awm.kl_ema_decay` | 0.3 | Maximum EMA decay used for the adaptive KL reference |
 | `sampling.cfg_scale` | 1.0 | Rollout CFG scale; `1.0` keeps rollout and training policy aligned |
 | `sampling.grid_interval` | 200 | Save a fixed-class EMA sample grid every N completed optimizer steps |
+| `eval.enabled` | `true` | Run distributed 50K-sample FID/IS evaluation when checkpoints are saved |
+| `eval.batch_size` | 50 | Per-GPU evaluation generation batch size |
 | `reward.model_name` | `dinov2_vitl14_lc` | Frozen DINOv2 ImageNet classifier reward |
 | `reward.mode` | `logprob` | Uses `log p_DINOv2(class | image)` as the scalar reward |
 
-For the default 8-GPU launch, each optimizer step generates `8 * 4 * 4 = 128` images globally and trains on `128 * 4 = 512` noised latent/target pairs.
+For the default 8-GPU launch, each optimizer step samples different labels on each GPU, generates `8 * 8 * 8 = 512` images globally, and computes advantages within each GPU's `8` samples per class. The denoising/AWM loss is then split into `training.gradient_accumulation_steps=4` microbatches, so each backward pass sees `16 * 4 = 64` noised latent/target pairs per GPU while the full optimizer step still uses `512 * 4 = 2048` noised pairs globally.
 
 ### Checkpoint Preparation
 
@@ -136,7 +140,7 @@ export CKPT_PATH=/path/to/UNITE-B.pt
 
 The default AWM config is [configs/imagenet_awm.yaml](configs/imagenet_awm.yaml), which matches the Base encoder + Base decoder checkpoint. For a Large checkpoint, update the `gen_tok` architecture fields to match the checkpoint before training.
 
-The DINOv2 reward model is loaded through `torch.hub` on the first run. Make sure the training environment can either download the DINOv2 weights or has them already cached.
+The DINOv2 reward model is loaded through `torch.hub` on the first run. Make sure the training environment can either download the DINOv2 weights or has them already cached. Checkpoint-time FID/IS evaluation uses the same `INCEPTION_WEIGHTS` and `IN256_FID_STATS` environment variables described above; set `eval.enabled: false` to skip it.
 
 ### Launch
 
@@ -156,7 +160,7 @@ torchrun --nproc_per_node=8 main_train_awm.py \
     --experiment-name unite-awm-dinov2
 ```
 
-Checkpoints are written to `outputs_awm/<experiment-name>/checkpoints/` and contain the current policy, checkpoint EMA policy, adaptive KL-EMA policy, optimizer state, and the rollout CFG scale. Fixed-class sample grids are written to `outputs_awm/<experiment-name>/samples/`; `fixed_grid_classes.txt` records the repeated class-id order used in each grid. The fine-tuning loss includes two optional stability terms: `awm.beta_kl` keeps the policy close to the frozen pretrained UNITE reference, while `awm.ema_beta` keeps it close to an adaptive EMA reference whose decay follows `awm.kl_ema_decay_type` up to `awm.kl_ema_decay`.
+Checkpoints are written to `outputs_awm/<experiment-name>/checkpoints/` and contain the current policy, checkpoint EMA policy, adaptive KL-EMA policy, optimizer state, and the rollout CFG scale. Fixed-class sample grids are written to `outputs_awm/<experiment-name>/samples/`; `fixed_grid_classes.txt` records the repeated class-id order used in each grid. When `eval.enabled` is true, each checkpoint also triggers distributed EMA sampling for 50K balanced ImageNet labels and logs FID-50K/IS-50K to `outputs_awm/<experiment-name>/eval/metrics.jsonl`. The fine-tuning loss includes two optional stability terms: `awm.beta_kl` keeps the policy close to the frozen pretrained UNITE reference, while `awm.ema_beta` keeps it close to an adaptive EMA reference whose decay follows `awm.kl_ema_decay_type` up to `awm.kl_ema_decay`.
 
 ### Reproducing Paper Results
 To reproduce the paper results for UNITE-B (with 3 flow mini batches per each reconstruction step)on a single-node on ImageNet-1K 256×256, use the  config

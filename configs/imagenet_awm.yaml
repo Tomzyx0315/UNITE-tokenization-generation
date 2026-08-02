@@ -10,7 +10,7 @@ training:
   precision: "bf16"
   freeze_decoder: true
   freeze_patch_embed: true
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   clip_grad: 1.0
   ema_decay: 0.999
   log_interval: 10
@@ -34,6 +34,18 @@ sampling:
   grid_samples_per_class: 2
   grid_seed: 12345
 
+eval:
+  enabled: true
+  num_images: 50000
+  num_classes: 1000
+  image_size: 256
+  batch_size: 50
+  # Defaults follow sampling.cfg_* if these are omitted.
+  cfg_scales: [1.0]
+  cfg_intervals: [[0.1, 1.0]]
+  cfg_norm_orders: ["both"]
+  offload_reward_model: true
+
 reward:
   type: "dinov2_imagenet"
   model_name: "dinov2_vitl14_lc"
@@ -41,8 +53,9 @@ reward:
   scale: 1.0
 
 awm:
-  classes_per_rank: 4
-  samples_per_class: 4
+  classes_per_rank: 8
+  samples_per_class: 8
+  rollout_micro_batch_size: 16
   train_timesteps: 4
   beta_kl: 0.05             # velocity-space KL to frozen pretrained UNITE
   ema_beta: 1.0             # velocity-space KL to adaptive EMA reference

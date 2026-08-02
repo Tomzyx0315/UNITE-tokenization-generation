@@ -14,12 +14,14 @@ import sys
 import time
 import logging
 import shutil
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 import tqdm as tqdm_module
 from PIL import Image
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.amp import autocast
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torch.utils.data import DataLoader, Subset
@@ -106,12 +108,15 @@ def evaluate_fid(
     log_to_wandb: bool = True,
     log_fid_best: bool = True,
     current_best_cfg_scale: float = 2.4,
-) -> Tuple[int, float, float]:
+    return_metrics: bool = False,
+    autocast_kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[float, float] | Tuple[float, float, float]:
     """Evaluate FID by generating images and computing FID online.
 
     Uses Inception feature extraction in memory — no disk I/O.
 
-    Returns: (best_cfg_scale, best_fid).
+    Returns: (best_cfg_scale, best_fid), or with return_metrics=True,
+    (best_cfg_scale, best_fid, best_is).
     """
 
     if cfg_scales is None:
@@ -159,6 +164,8 @@ def evaluate_fid(
     best_fid = float("inf")
     best_cfg_scale = current_best_cfg_scale
     overall_best_fid = float("inf")
+    overall_best_is = 0.0
+    device_type = "cuda" if device.type == "cuda" else "cpu"
 
     try:
         for cfg_norm_order in cfg_norm_orders:
@@ -178,14 +185,20 @@ def evaluate_fid(
                             e = min(s + batch_size, len(my_indices))
                             y = torch.tensor(my_labels[s:e], dtype=torch.long, device=device)
 
-                            samples = ema_model.diffusion_generate(
-                                device=device,
-                                num_visuals=len(y),
-                                cfg_scale=cfg_scale,
-                                cfg_interval=cfg_interval,
-                                cfg_norm_order=cfg_norm_order,
-                                y_given=y,
-                            ).clamp(0.0, 1.0)
+                            cast_context = (
+                                autocast(device_type, **autocast_kwargs)
+                                if autocast_kwargs is not None and autocast_kwargs.get("enabled", False)
+                                else nullcontext()
+                            )
+                            with cast_context:
+                                samples = ema_model.diffusion_generate(
+                                    device=device,
+                                    num_visuals=len(y),
+                                    cfg_scale=cfg_scale,
+                                    cfg_interval=cfg_interval,
+                                    cfg_norm_order=cfg_norm_order,
+                                    y_given=y,
+                                ).clamp(0.0, 1.0)
 
                             pool3, logits = extract_inception_features(
                                 samples, inception_model, batch_size=len(y)
@@ -245,6 +258,7 @@ def evaluate_fid(
                     # Track bests
                     if fid_val < overall_best_fid:
                         overall_best_fid = fid_val
+                        overall_best_is = is_val
                     if cfg_norm_order == "norm_first" and fid_val < best_fid:
                         best_fid = fid_val
                         best_cfg_scale = cfg_scale
@@ -253,14 +267,20 @@ def evaluate_fid(
                     if log_to_wandb and rank == 0:
                         with torch.no_grad():
                             vis_y = torch.tensor(vis_labels, dtype=torch.long, device=device)
-                            vis = ema_model.diffusion_generate(
-                                device=device,
-                                num_visuals=36,
-                                cfg_scale=cfg_scale,
-                                cfg_interval=cfg_interval,
-                                cfg_norm_order=cfg_norm_order,
-                                y_given=vis_y,
-                            ).clamp(0.0, 1.0).cpu()
+                            cast_context = (
+                                autocast(device_type, **autocast_kwargs)
+                                if autocast_kwargs is not None and autocast_kwargs.get("enabled", False)
+                                else nullcontext()
+                            )
+                            with cast_context:
+                                vis = ema_model.diffusion_generate(
+                                    device=device,
+                                    num_visuals=36,
+                                    cfg_scale=cfg_scale,
+                                    cfg_interval=cfg_interval,
+                                    cfg_norm_order=cfg_norm_order,
+                                    y_given=vis_y,
+                                ).clamp(0.0, 1.0).cpu()
 
                         try:
                             import wandb
@@ -294,6 +314,8 @@ def evaluate_fid(
     if log_to_wandb and log_fid_best and is_main_process():
         wandb_utils.log({"fid-best": overall_best_fid, "fid/best_cfg_scale": best_cfg_scale}, step=global_step)
 
+    if return_metrics:
+        return best_cfg_scale, overall_best_fid, overall_best_is
     return best_cfg_scale, overall_best_fid
 
 
@@ -679,5 +701,3 @@ def on_epoch_end_rfid(ema, raw_model, device, global_step, epoch):
     if is_main_process() == 0:
         logger.info(f"[R-FID] Running reconstruction FID at epoch {epoch + 1}")
     evaluate_rfid(ema, model=raw_model, device=device, global_step=global_step)
-
-

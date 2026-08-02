@@ -50,6 +50,16 @@ class DINOv2ImageNetReward:
         self.mean = mean.view(1, 3, 1, 1)
         self.std = std.view(1, 3, 1, 1)
 
+    def to(self, device: torch.device) -> "DINOv2ImageNetReward":
+        self.device = torch.device(device)
+        if self.device.type == "cuda":
+            self.model = self.model.to(device=self.device, dtype=self.dtype)
+        else:
+            self.model = self.model.to(device=self.device)
+        self.mean = self.mean.to(device=self.device)
+        self.std = self.std.to(device=self.device)
+        return self
+
     def _preprocess(self, images: torch.Tensor) -> torch.Tensor:
         images = images.detach().to(self.device, dtype=torch.float32).clamp(0.0, 1.0)
         images = F.interpolate(
