@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, required=True, help="YAML config file.")
     parser.add_argument("--ckpt", type=str, required=True, help="Pretrained UNITE checkpoint.")
     parser.add_argument("--data-path", type=str, default=None, help="ImageNet train directory for reconstruction.")
+    parser.add_argument("--data-index-path", type=str, default=None, help="Writable tar index cache path for reconstruction.")
     parser.add_argument("--results-dir", type=str, default="results_awm")
     parser.add_argument("--experiment-name", type=str, default="unite-awm")
     return parser.parse_args()
@@ -770,6 +771,11 @@ def main() -> None:
                 "reconstruction.enabled is true, but no data path was provided. "
                 "Set --data-path, reconstruction.data_path, or DATA_PATH."
             )
+        reconstruction_data_index_path = (
+            args.data_index_path
+            or reconstruction_cfg.get("data_index_path")
+            or os.environ.get("DATA_INDEX_PATH")
+        )
         reconstruction_loader, reconstruction_sampler = prepare_dataloader(
             reconstruction_data_path,
             int(reconstruction_cfg.get("image_size", 256)),
@@ -780,6 +786,7 @@ def main() -> None:
             transform_type=int(reconstruction_cfg.get("transform_type", 0)),
             rrc_scale_min=float(reconstruction_cfg.get("rrc_scale_min", 0.8)),
             rrc_scale_max=float(reconstruction_cfg.get("rrc_scale_max", 1.0)),
+            data_index_path=reconstruction_data_index_path,
         )
         reconstruction_batcher = ReconstructionBatcher(
             reconstruction_loader,
@@ -789,6 +796,7 @@ def main() -> None:
         if rank == 0:
             log.info(
                 f"[Reconstruction] enabled: data={reconstruction_data_path}, "
+                f"index={reconstruction_data_index_path}, "
                 f"batch/GPU={reconstruction_batch_size}, "
                 f"micro_batch={reconstruction_micro_batch_size}, "
                 f"weight={float(reconstruction_cfg.get('weight', 1.0))}"

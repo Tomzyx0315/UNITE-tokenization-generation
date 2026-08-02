@@ -48,7 +48,8 @@ eval:
 
 reconstruction:
   enabled: true
-  data_path: null             # falls back to --data-path or DATA_PATH
+  data_path: null             # ImageFolder dir, ILSVRC2012_img_train.tar, or parent dir; falls back to --data-path/DATA_PATH
+  data_index_path: null       # writable .npz tar index cache; falls back to --data-index-path/DATA_INDEX_PATH
   image_size: 256
   batch_size: 64
   micro_batch_size: 16

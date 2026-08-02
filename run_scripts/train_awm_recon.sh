@@ -6,10 +6,16 @@ set -euo pipefail
 : "${CKPT_PATH:?Set CKPT_PATH=/path/to/pretrained_unite.pt before running this script.}"
 : "${DATA_PATH:?Set DATA_PATH=/path/to/imagenet/train before running this script.}"
 
+EXTRA_ARGS=()
+if [[ -n "${DATA_INDEX_PATH:-}" ]]; then
+  EXTRA_ARGS+=(--data-index-path "$DATA_INDEX_PATH")
+fi
+
 TORCH_DISTRIBUTED_DEBUG=INFO torchrun --nproc_per_node=8 \
   --master_port=12343 main_train_awm.py \
   --config configs/imagenet_awm_recon.yaml \
   --ckpt "$CKPT_PATH" \
   --data-path "$DATA_PATH" \
   --results-dir outputs_awm \
-  --experiment-name unite-awm-recon-dinov2
+  --experiment-name unite-awm-recon-dinov2 \
+  "${EXTRA_ARGS[@]}"

@@ -107,7 +107,7 @@ This repository also includes an Advantage Weighted Matching (AWM) fine-tuning e
 
 ### Data
 
-AWM-only rollouts do not require an ImageNet dataloader: class labels are sampled uniformly from `0..999`, and multiple images are generated for each label to compute within-class advantages. The reconstruction variant uses a real ImageNet train directory for UNITE-style reconstruction training; provide it with `--data-path`, `reconstruction.data_path`, or `DATA_PATH`.
+AWM-only rollouts do not require an ImageNet dataloader: class labels are sampled uniformly from `0..999`, and multiple images are generated for each label to compute within-class advantages. The reconstruction variant uses real ImageNet images for UNITE-style reconstruction training; provide an extracted `ImageFolder` train directory, `ILSVRC2012_img_train.tar`, or the parent directory containing that tar with `--data-path`, `reconstruction.data_path`, or `DATA_PATH`.
 
 The default config uses:
 
@@ -169,6 +169,13 @@ Single-node 8-GPU AWM + reconstruction launch:
 ```bash
 export DATA_PATH=/path/to/imagenet/train
 bash run_scripts/train_awm_recon.sh
+```
+
+If ImageNet is only available as the official read-only tar archive, point `DATA_PATH` at either the tar itself or its parent directory. If the archive directory is not writable, set `DATA_INDEX_PATH` to a writable `.npz` path for the tar offset index:
+
+```bash
+export DATA_PATH=/path/to/ILSVRC2012_img_train.tar
+export DATA_INDEX_PATH=/path/to/writable/imagenet_train_tar_index.npz
 ```
 
 Checkpoints are written to `outputs_awm/<experiment-name>/checkpoints/` and contain the current policy, checkpoint EMA policy, adaptive KL-EMA policy, optimizer state, and the rollout CFG scale. Fixed-class sample grids are written to `outputs_awm/<experiment-name>/samples/`; `fixed_grid_classes.txt` records the repeated class-id order used in each grid. When `eval.enabled` is true, each checkpoint also triggers distributed EMA sampling for 50K balanced ImageNet labels and logs FID-50K/IS-50K to `outputs_awm/<experiment-name>/eval/metrics.jsonl`. The fine-tuning loss includes two optional stability terms: `awm.beta_kl` keeps the policy close to the frozen pretrained UNITE reference, while `awm.ema_beta` keeps it close to an adaptive EMA reference whose decay follows `awm.kl_ema_decay_type` up to `awm.kl_ema_decay`.
