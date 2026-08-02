@@ -162,6 +162,19 @@ torchrun --nproc_per_node=8 main_train_awm.py \
 
 Checkpoints are written to `outputs_awm/<experiment-name>/checkpoints/` and contain the current policy, checkpoint EMA policy, adaptive KL-EMA policy, optimizer state, and the rollout CFG scale. Fixed-class sample grids are written to `outputs_awm/<experiment-name>/samples/`; `fixed_grid_classes.txt` records the repeated class-id order used in each grid. When `eval.enabled` is true, each checkpoint also triggers distributed EMA sampling for 50K balanced ImageNet labels and logs FID-50K/IS-50K to `outputs_awm/<experiment-name>/eval/metrics.jsonl`. The fine-tuning loss includes two optional stability terms: `awm.beta_kl` keeps the policy close to the frozen pretrained UNITE reference, while `awm.ema_beta` keeps it close to an adaptive EMA reference whose decay follows `awm.kl_ema_decay_type` up to `awm.kl_ema_decay`.
 
+To backfill FID/IS for checkpoints that were saved before checkpoint-time eval was enabled, run:
+
+```bash
+torchrun --nproc_per_node=8 eval_awm_checkpoints.py \
+    --config configs/imagenet_awm.yaml \
+    --checkpoint-dir outputs_awm/unite-awm-dinov2/checkpoints \
+    --output-dir outputs_awm/unite-awm-dinov2/eval_offline \
+    --state-key ema \
+    --skip-existing
+```
+
+This loads one checkpoint at a time, evaluates its EMA weights, and appends results to `eval_offline/metrics.jsonl`.
+
 ### Reproducing Paper Results
 To reproduce the paper results for UNITE-B (with 3 flow mini batches per each reconstruction step)on a single-node on ImageNet-1K 256×256, use the  config
 [`configs/imagenet.yaml`](configs/imagenet.yaml).
