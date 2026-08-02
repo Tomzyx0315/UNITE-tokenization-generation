@@ -13,6 +13,7 @@ This is the code repository of the paper:
 [Setup](#Setup)  
 [Datasets](#Datasets)  
 [Training](#Training)  
+[AWM Fine-Tuning](#AWMFineTuning)  
 [Pretrained Checkpoints](#PretrainedCheckpoints)  
 [Evaluation](#Evaluation)  
 [Citation](#Citation)  
@@ -95,10 +96,66 @@ Key config fields (see `configs/imagenet.yaml`):
 | `grad_accum_steps` | 2 | Gradient accumulation steps (batch/GPU = total / world_size / accum) |
 | `flow_steps_per_recon` | 3 | Flow matching steps per reconstruction forward pass |
 | `flow_mini_batch` | 4 | Chunk size for flow steps (controls peak memory) |
-`torch_compile_decoder` | true | torch.compile the decoder for faster training |
+| `torch_compile_decoder` | true | torch.compile the decoder for faster training |
 
 **Evaluation during training:**  FID is evaluated automatically at the end of each `fid_epoch` interval (default: every 40 epochs). The evaluation uses adaptive CFG scale search: starting from the current best scale, it tests neighboring scales and updates the best. At `fid_sweep_epoch` intervals (default: 120 epochs), a more comprehensive sweep is performed across multiple CFG intervals and normalization orders.
 
+<a name="AWMFineTuning"></a>
+## AWM Fine-Tuning (Experimental)
+
+This repository also includes a first-pass Advantage Weighted Matching (AWM) fine-tuning entry point for pretrained ImageNet UNITE checkpoints. This path treats UNITE as a normal class-conditional latent denoiser plus decoder: it rolls out images from class labels, scores them with a frozen reward model, and updates the denoiser with an AWM-style flow matching loss. It does not use reconstruction loss.
+
+### Data
+
+AWM fine-tuning does not require an ImageNet dataloader in this first version. Class labels are sampled uniformly from `0..999`, and multiple images are generated for each label to compute within-class advantages.
+
+The default config uses:
+
+| Field | Default | Description |
+|:------|:-------:|:------------|
+| `awm.classes_per_rank` | 4 | Number of ImageNet classes sampled per GPU per rollout |
+| `awm.samples_per_class` | 4 | Images sampled per class label; this is the advantage group size |
+| `awm.train_timesteps` | 4 | Number of random flow timesteps trained per generated latent |
+| `awm.beta_kl` | 0.05 | Velocity-space KL coefficient to the frozen pretrained UNITE reference |
+| `awm.ema_beta` | 1.0 | Velocity-space KL coefficient to the adaptive EMA reference |
+| `awm.kl_ema_decay` | 0.3 | Maximum EMA decay used for the adaptive KL reference |
+| `sampling.cfg_scale` | 1.0 | Rollout CFG scale; `1.0` keeps rollout and training policy aligned |
+| `reward.model_name` | `dinov2_vitl14_lc` | Frozen DINOv2 ImageNet classifier reward |
+| `reward.mode` | `logprob` | Uses `log p_DINOv2(class | image)` as the scalar reward |
+
+For the default 8-GPU launch, each optimizer step generates `8 * 4 * 4 = 128` images globally and trains on `128 * 4 = 512` noised latent/target pairs.
+
+### Checkpoint Preparation
+
+Download a pretrained UNITE checkpoint and set `CKPT_PATH` before launching:
+
+```bash
+export CKPT_PATH=/path/to/UNITE-B.pt
+```
+
+The default AWM config is [configs/imagenet_awm.yaml](configs/imagenet_awm.yaml), which matches the Base encoder + Base decoder checkpoint. For a Large checkpoint, update the `gen_tok` architecture fields to match the checkpoint before training.
+
+The DINOv2 reward model is loaded through `torch.hub` on the first run. Make sure the training environment can either download the DINOv2 weights or has them already cached.
+
+### Launch
+
+Single-node 8-GPU launch:
+
+```bash
+bash run_scripts/train_awm.sh
+```
+
+Equivalent direct launch:
+
+```bash
+torchrun --nproc_per_node=8 main_train_awm.py \
+    --config configs/imagenet_awm.yaml \
+    --ckpt "$CKPT_PATH" \
+    --results-dir outputs_awm \
+    --experiment-name unite-awm-dinov2
+```
+
+Checkpoints are written to `outputs_awm/<experiment-name>/checkpoints/` and contain the current policy, checkpoint EMA policy, adaptive KL-EMA policy, optimizer state, and the rollout CFG scale. The fine-tuning loss includes two optional stability terms: `awm.beta_kl` keeps the policy close to the frozen pretrained UNITE reference, while `awm.ema_beta` keeps it close to an adaptive EMA reference whose decay follows `awm.kl_ema_decay_type` up to `awm.kl_ema_decay`.
 
 ### Reproducing Paper Results
 To reproduce the paper results for UNITE-B (with 3 flow mini batches per each reconstruction step)on a single-node on ImageNet-1K 256×256, use the  config
