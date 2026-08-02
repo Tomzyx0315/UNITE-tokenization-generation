@@ -23,6 +23,7 @@ import torch.nn as nn
 import yaml
 from torch.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torchvision.utils import save_image
 
 from models.unite import UNITE
 from utils.distributed import cleanup_distributed, is_main_process, setup_distributed
@@ -266,6 +267,69 @@ def save_awm_checkpoint(
     )
 
 
+def build_fixed_grid(
+    policy: UNITE,
+    sample_cfg: Dict[str, Any],
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    class_ids = [int(x) for x in sample_cfg.get("grid_classes", [])]
+    if not class_ids:
+        raise ValueError("sampling.grid_classes must be non-empty when grid_interval > 0.")
+    if min(class_ids) < 0 or max(class_ids) >= policy.num_classes:
+        raise ValueError(
+            f"sampling.grid_classes must be in [0, {policy.num_classes - 1}], got {class_ids}."
+        )
+
+    samples_per_class = int(sample_cfg.get("grid_samples_per_class", 2))
+    if samples_per_class <= 0:
+        raise ValueError("sampling.grid_samples_per_class must be positive.")
+
+    labels = torch.tensor(class_ids, dtype=torch.long).repeat_interleave(samples_per_class)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(sample_cfg.get("grid_seed", 12345)))
+    noise = torch.randn(
+        labels.shape[0],
+        policy.num_latent_tokens,
+        policy.diffusion_input_dim,
+        generator=generator,
+    )
+    return labels.to(device), noise.to(device), samples_per_class
+
+
+@torch.no_grad()
+def save_sample_grid(
+    policy: UNITE,
+    *,
+    sample_dir: str,
+    step: int,
+    labels: torch.Tensor,
+    noise: torch.Tensor,
+    nrow: int,
+    device: torch.device,
+    device_type: str,
+    autocast_kwargs: Dict[str, Any],
+    cfg_scale: float,
+    cfg_interval: Tuple[float, float],
+    cfg_norm_order: str,
+) -> str:
+    os.makedirs(sample_dir, exist_ok=True)
+    policy.eval()
+    with autocast(device_type, **autocast_kwargs):
+        images = policy.diffusion_generate(
+            device=device,
+            num_visuals=labels.shape[0],
+            cfg_scale=cfg_scale,
+            cfg_interval=cfg_interval,
+            cfg_norm_order=cfg_norm_order,
+            y_given=labels,
+            noise=noise,
+        )
+
+    path = os.path.join(sample_dir, f"step_{step:07d}.png")
+    save_image(images.clamp(0.0, 1.0).float().cpu(), path, nrow=nrow)
+    return path
+
+
 def main() -> None:
     args = parse_args()
     rank, world_size, device = setup_distributed()
@@ -286,11 +350,14 @@ def main() -> None:
     if rank == 0:
         experiment_dir = os.path.join(args.results_dir, args.experiment_name)
         checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
+        sample_dir = os.path.join(experiment_dir, "samples")
         os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(sample_dir, exist_ok=True)
         log = create_logger(experiment_dir)
         log.info(f"Experiment directory created at {experiment_dir}")
     else:
         checkpoint_dir = os.path.join(args.results_dir, args.experiment_name, "checkpoints")
+        sample_dir = None
         log = create_logger(None)
 
     policy = UNITE(gen_tok_cfg, num_classes=int(training_cfg.get("num_classes", 1000))).to(device)
@@ -362,10 +429,35 @@ def main() -> None:
     cfg_interval = tuple(float(x) for x in sample_cfg.get("cfg_interval", (0.1, 1.0)))
     cfg_scale = float(sample_cfg.get("cfg_scale", 1.0))
     cfg_norm_order = str(sample_cfg.get("cfg_norm_order", "norm_first"))
+    grid_interval = int(sample_cfg.get("grid_interval", 0))
 
     device_type = "cuda" if device.type == "cuda" else "cpu"
     raw_module = ddp_model.module if hasattr(ddp_model, "module") else ddp_model
     global_step = 0
+
+    grid_labels = grid_noise = None
+    grid_nrow = 0
+    if is_main_process() and grid_interval > 0:
+        grid_labels, grid_noise, grid_nrow = build_fixed_grid(ema_policy, sample_cfg, device)
+        label_path = os.path.join(sample_dir, "fixed_grid_classes.txt")
+        with open(label_path, "w") as f:
+            f.write(" ".join(str(int(x)) for x in grid_labels.cpu().tolist()))
+            f.write("\n")
+        grid_path = save_sample_grid(
+            ema_policy,
+            sample_dir=sample_dir,
+            step=global_step,
+            labels=grid_labels,
+            noise=grid_noise,
+            nrow=grid_nrow,
+            device=device,
+            device_type=device_type,
+            autocast_kwargs=autocast_kwargs,
+            cfg_scale=cfg_scale,
+            cfg_interval=cfg_interval,
+            cfg_norm_order=cfg_norm_order,
+        )
+        logger.info(f"[Sample Grid] Saved: {grid_path}")
 
     if rank == 0:
         trainable = sum(p.numel() for p in params)
@@ -436,6 +528,28 @@ def main() -> None:
                 raw_module.policy,
                 get_kl_ema_decay(awm_cfg, global_step),
             )
+
+        completed_step = global_step + 1
+        if (
+            is_main_process()
+            and grid_interval > 0
+            and completed_step % grid_interval == 0
+        ):
+            grid_path = save_sample_grid(
+                ema_policy,
+                sample_dir=sample_dir,
+                step=completed_step,
+                labels=grid_labels,
+                noise=grid_noise,
+                nrow=grid_nrow,
+                device=device,
+                device_type=device_type,
+                autocast_kwargs=autocast_kwargs,
+                cfg_scale=cfg_scale,
+                cfg_interval=cfg_interval,
+                cfg_norm_order=cfg_norm_order,
+            )
+            logger.info(f"[Sample Grid] Saved: {grid_path}")
 
         if is_main_process() and global_step % log_interval == 0:
             log_stats = {

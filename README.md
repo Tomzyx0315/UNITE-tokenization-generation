@@ -120,6 +120,7 @@ The default config uses:
 | `awm.ema_beta` | 1.0 | Velocity-space KL coefficient to the adaptive EMA reference |
 | `awm.kl_ema_decay` | 0.3 | Maximum EMA decay used for the adaptive KL reference |
 | `sampling.cfg_scale` | 1.0 | Rollout CFG scale; `1.0` keeps rollout and training policy aligned |
+| `sampling.grid_interval` | 200 | Save a fixed-class EMA sample grid every N completed optimizer steps |
 | `reward.model_name` | `dinov2_vitl14_lc` | Frozen DINOv2 ImageNet classifier reward |
 | `reward.mode` | `logprob` | Uses `log p_DINOv2(class | image)` as the scalar reward |
 
@@ -155,7 +156,7 @@ torchrun --nproc_per_node=8 main_train_awm.py \
     --experiment-name unite-awm-dinov2
 ```
 
-Checkpoints are written to `outputs_awm/<experiment-name>/checkpoints/` and contain the current policy, checkpoint EMA policy, adaptive KL-EMA policy, optimizer state, and the rollout CFG scale. The fine-tuning loss includes two optional stability terms: `awm.beta_kl` keeps the policy close to the frozen pretrained UNITE reference, while `awm.ema_beta` keeps it close to an adaptive EMA reference whose decay follows `awm.kl_ema_decay_type` up to `awm.kl_ema_decay`.
+Checkpoints are written to `outputs_awm/<experiment-name>/checkpoints/` and contain the current policy, checkpoint EMA policy, adaptive KL-EMA policy, optimizer state, and the rollout CFG scale. Fixed-class sample grids are written to `outputs_awm/<experiment-name>/samples/`; `fixed_grid_classes.txt` records the repeated class-id order used in each grid. The fine-tuning loss includes two optional stability terms: `awm.beta_kl` keeps the policy close to the frozen pretrained UNITE reference, while `awm.ema_beta` keeps it close to an adaptive EMA reference whose decay follows `awm.kl_ema_decay_type` up to `awm.kl_ema_decay`.
 
 ### Reproducing Paper Results
 To reproduce the paper results for UNITE-B (with 3 flow mini batches per each reconstruction step)on a single-node on ImageNet-1K 256×256, use the  config

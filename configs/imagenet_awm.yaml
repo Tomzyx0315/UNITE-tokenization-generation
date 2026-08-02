@@ -29,6 +29,10 @@ sampling:
   # With cfg_scale=1, UNITE applies encoder layer norm in diffusion_generate()
   # only for cfg_first/both; use both so rollout matches the flow loss path.
   cfg_norm_order: "both"
+  grid_interval: 200
+  grid_classes: [0, 10, 100, 200, 300, 400, 500, 600]
+  grid_samples_per_class: 2
+  grid_seed: 12345
 
 reward:
   type: "dinov2_imagenet"
