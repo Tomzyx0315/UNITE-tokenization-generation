@@ -1,0 +1,103 @@
+# AWM + UNITE reconstruction fine-tuning config for a pretrained ImageNet checkpoint.
+# This keeps the AWM rollout objective and also trains the original UNITE
+# reconstruction path on real ImageNet images.
+
+training:
+  max_train_steps: 10000
+  global_seed: 0
+  num_classes: 1000
+  init_from: "ema"          # use EMA weights from pretrained UNITE if present
+  precision: "bf16"
+  freeze_decoder: false
+  freeze_patch_embed: false
+  gradient_accumulation_steps: 4
+  clip_grad: 1.0
+  ema_decay: 0.999
+  log_interval: 10
+  checkpoint_interval: 1000
+  optimizer:
+    lr: 1.0e-6
+    betas: [0.9, 0.999]
+    weight_decay: 0.0
+    eps: 1.0e-8
+
+sampling:
+  # For strict on-policy matching, keep CFG at 1.0. Higher CFG can be explored,
+  # but then rollout and the single conditional flow loss are less aligned.
+  cfg_scale: 1.0
+  cfg_interval: [0.1, 1.0]
+  # With cfg_scale=1, UNITE applies encoder layer norm in diffusion_generate()
+  # only for cfg_first/both; use both so rollout matches the flow loss path.
+  cfg_norm_order: "both"
+  grid_interval: 200
+  grid_classes: [0, 10, 100, 200, 300, 400, 500, 600]
+  grid_samples_per_class: 2
+  grid_seed: 12345
+
+eval:
+  enabled: true
+  num_images: 50000
+  num_classes: 1000
+  image_size: 256
+  batch_size: 50
+  # Defaults follow sampling.cfg_* if these are omitted.
+  cfg_scales: [1.0]
+  cfg_intervals: [[0.1, 1.0]]
+  cfg_norm_orders: ["both"]
+  offload_reward_model: true
+
+reconstruction:
+  enabled: true
+  data_path: null             # falls back to --data-path or DATA_PATH
+  image_size: 256
+  batch_size: 64
+  micro_batch_size: 16
+  num_workers: 4
+  transform_type: 0
+  rrc_scale_min: 0.8
+  rrc_scale_max: 1.0
+  weight: 1.0                 # UNITE uses reconstruction loss with coefficient 1
+
+reward:
+  type: "dinov2_imagenet"
+  model_name: "dinov2_vitl14_lc"
+  mode: "logprob"           # log p_DINOv2(class | generated image)
+  scale: 1.0
+
+awm:
+  classes_per_rank: 8
+  samples_per_class: 8
+  rollout_micro_batch_size: 16
+  train_timesteps: 4
+  beta_kl: 0.05             # velocity-space KL to frozen pretrained UNITE
+  ema_beta: 1.0             # velocity-space KL to adaptive EMA reference
+  kl_ema_decay: 0.3
+  kl_ema_decay_type: "linear"
+  clip_range: 1.0
+  logprob_scale: 1.0
+  advantage_eps: 1.0e-4
+  advantage_clip: 5.0
+  advantage_max: 1.0
+  gradient_checkpointing: false
+
+gen_tok:
+  diffusion_input_dim: 32
+  encoder_model_size: "Base"
+  decoder_model_size: "Base"
+  patch_size: 16
+  flow_steps_per_recon: 3
+  flow_mini_batch: 3
+  timestep_shift_mode: "manual"
+  timestep_shift_alpha: 0.5
+  timestep_shift_base_dim: 4096
+  timestep_shift_effective_dim_mode: "total"
+  modulation_recon_timestep_max: 0.01
+  noising_t_start: 0.7
+  lognorm_mu: 0.0
+  lognorm_sigma: 1.0
+  in_content_len: 32
+  in_content_start: 4
+  use_qknorm_encoder: true
+  loss:
+    perceptual_weight: 1.0
+    gen_loss_weight: 1.0

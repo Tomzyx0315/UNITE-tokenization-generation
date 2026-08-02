@@ -103,17 +103,19 @@ Key config fields (see `configs/imagenet.yaml`):
 <a name="AWMFineTuning"></a>
 ## AWM Fine-Tuning (Experimental)
 
-This repository also includes a first-pass Advantage Weighted Matching (AWM) fine-tuning entry point for pretrained ImageNet UNITE checkpoints. This path treats UNITE as a normal class-conditional latent denoiser plus decoder: it rolls out images from class labels, scores them with a frozen reward model, and updates the denoiser with an AWM-style flow matching loss. It does not use reconstruction loss.
+This repository also includes an Advantage Weighted Matching (AWM) fine-tuning entry point for pretrained ImageNet UNITE checkpoints. The default AWM config rolls out images from class labels, scores them with a frozen reward model, and updates the latent denoiser with an AWM-style flow matching loss while keeping the decoder/tokenizer side frozen as a control experiment. A separate reconstruction variant can also keep the original UNITE reconstruction path active on real ImageNet images.
 
 ### Data
 
-AWM fine-tuning does not require an ImageNet dataloader in this first version. Class labels are sampled uniformly from `0..999`, and multiple images are generated for each label to compute within-class advantages.
+AWM-only rollouts do not require an ImageNet dataloader: class labels are sampled uniformly from `0..999`, and multiple images are generated for each label to compute within-class advantages. The reconstruction variant uses a real ImageNet train directory for UNITE-style reconstruction training; provide it with `--data-path`, `reconstruction.data_path`, or `DATA_PATH`.
 
 The default config uses:
 
 | Field | Default | Description |
 |:------|:-------:|:------------|
 | `training.gradient_accumulation_steps` | 4 | Number of denoising/AWM loss microbatches per rollout |
+| `training.freeze_decoder` | `true` | Keep the pretrained decoder frozen for the AWM-only control |
+| `training.freeze_patch_embed` | `true` | Keep the image patch embedding frozen for the AWM-only control |
 | `awm.classes_per_rank` | 8 | Number of ImageNet classes sampled per GPU per rollout |
 | `awm.samples_per_class` | 8 | Images sampled per class label; this is the per-rank advantage group size |
 | `awm.rollout_micro_batch_size` | 16 | No-grad rollout/reward microbatch size used before the denoising loss accumulation |
@@ -130,6 +132,8 @@ The default config uses:
 
 For the default 8-GPU launch, each optimizer step samples different labels on each GPU, generates `8 * 8 * 8 = 512` images globally, and computes advantages within each GPU's `8` samples per class. The denoising/AWM loss is then split into `training.gradient_accumulation_steps=4` microbatches, so each backward pass sees `16 * 4 = 64` noised latent/target pairs per GPU while the full optimizer step still uses `512 * 4 = 2048` noised pairs globally.
 
+The reconstruction variant is [configs/imagenet_awm_recon.yaml](configs/imagenet_awm_recon.yaml). It sets `training.freeze_decoder: false`, `training.freeze_patch_embed: false`, and `reconstruction.enabled: true`, so both the encoder/tokenizer path and decoder receive UNITE's L1 + LPIPS reconstruction loss. The reconstruction batch is 64 images per GPU and is split into 16-image backward microbatches after the AWM backward passes, reducing peak activation overlap.
+
 ### Checkpoint Preparation
 
 Download a pretrained UNITE checkpoint and set `CKPT_PATH` before launching:
@@ -138,13 +142,13 @@ Download a pretrained UNITE checkpoint and set `CKPT_PATH` before launching:
 export CKPT_PATH=/path/to/UNITE-B.pt
 ```
 
-The default AWM config is [configs/imagenet_awm.yaml](configs/imagenet_awm.yaml), which matches the Base encoder + Base decoder checkpoint. For a Large checkpoint, update the `gen_tok` architecture fields to match the checkpoint before training.
+The default AWM-only config is [configs/imagenet_awm.yaml](configs/imagenet_awm.yaml), which matches the Base encoder + Base decoder checkpoint. The AWM + reconstruction config is [configs/imagenet_awm_recon.yaml](configs/imagenet_awm_recon.yaml). For a Large checkpoint, update the `gen_tok` architecture fields to match the checkpoint before training.
 
 The DINOv2 reward model is loaded through `torch.hub` on the first run. Make sure the training environment can either download the DINOv2 weights or has them already cached. Checkpoint-time FID/IS evaluation uses the same `INCEPTION_WEIGHTS` and `IN256_FID_STATS` environment variables described above; set `eval.enabled: false` to skip it.
 
 ### Launch
 
-Single-node 8-GPU launch:
+Single-node 8-GPU AWM-only launch:
 
 ```bash
 bash run_scripts/train_awm.sh
@@ -158,6 +162,13 @@ torchrun --nproc_per_node=8 main_train_awm.py \
     --ckpt "$CKPT_PATH" \
     --results-dir outputs_awm \
     --experiment-name unite-awm-dinov2
+```
+
+Single-node 8-GPU AWM + reconstruction launch:
+
+```bash
+export DATA_PATH=/path/to/imagenet/train
+bash run_scripts/train_awm_recon.sh
 ```
 
 Checkpoints are written to `outputs_awm/<experiment-name>/checkpoints/` and contain the current policy, checkpoint EMA policy, adaptive KL-EMA policy, optimizer state, and the rollout CFG scale. Fixed-class sample grids are written to `outputs_awm/<experiment-name>/samples/`; `fixed_grid_classes.txt` records the repeated class-id order used in each grid. When `eval.enabled` is true, each checkpoint also triggers distributed EMA sampling for 50K balanced ImageNet labels and logs FID-50K/IS-50K to `outputs_awm/<experiment-name>/eval/metrics.jsonl`. The fine-tuning loss includes two optional stability terms: `awm.beta_kl` keeps the policy close to the frozen pretrained UNITE reference, while `awm.ema_beta` keeps it close to an adaptive EMA reference whose decay follows `awm.kl_ema_decay_type` up to `awm.kl_ema_decay`.

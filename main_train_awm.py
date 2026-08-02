@@ -3,8 +3,9 @@
 
 This intentionally treats UNITE as a pretrained latent denoiser plus decoder:
 roll out images from class labels, score them with a frozen reward model, and
-apply advantage-weighted flow matching on the generated latents. No
-reconstruction loss is used in this first experimental scaffold.
+apply advantage-weighted flow matching on the generated latents. Optionally,
+the original UNITE reconstruction path is trained on real images in the same
+optimizer step.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from torchvision.utils import save_image
 
 from engines.eval import evaluate_fid
 from models.unite import UNITE
+from utils.data import prepare_dataloader
 from utils.distributed import cleanup_distributed, is_main_process, setup_distributed
 from utils.ema import update_ema
 from utils.imagenet_reward import DINOv2ImageNetReward
@@ -46,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AWM fine-tune pretrained UNITE.")
     parser.add_argument("--config", type=str, required=True, help="YAML config file.")
     parser.add_argument("--ckpt", type=str, required=True, help="Pretrained UNITE checkpoint.")
+    parser.add_argument("--data-path", type=str, default=None, help="ImageNet train directory for reconstruction.")
     parser.add_argument("--results-dir", type=str, default="results_awm")
     parser.add_argument("--experiment-name", type=str, default="unite-awm")
     return parser.parse_args()
@@ -129,6 +132,7 @@ class UNITEAWMLoss(nn.Module):
         reference: UNITE,
         kl_ema_reference: UNITE,
         awm_cfg: Dict[str, Any],
+        reconstruction_cfg: Dict[str, Any],
     ) -> None:
         super().__init__()
         self.policy = policy
@@ -144,6 +148,8 @@ class UNITEAWMLoss(nn.Module):
         self.clip_range = None if self.clip_range is None else float(self.clip_range)
         self.logprob_scale = float(awm_cfg.get("logprob_scale", 1.0))
         self.checkpoint_blocks = bool(awm_cfg.get("gradient_checkpointing", False))
+        self.generation_weight = float(awm_cfg.get("generation_weight", getattr(policy, "gen_loss_weight", 1.0)))
+        self.reconstruction_weight = float(reconstruction_cfg.get("weight", 1.0))
 
     def _predict_x0(self, model: UNITE, z_t: torch.Tensor, t: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         pos_embed = model.latent_tokens[:, : z_t.shape[1]].expand(z_t.shape[0], -1, -1)
@@ -175,7 +181,7 @@ class UNITEAWMLoss(nn.Module):
         mse = (v_pred - v_target).pow(2).mean(dim=(1, 2))
         return -self.logprob_scale * mse, v_pred
 
-    def forward(
+    def _awm_forward(
         self,
         z_clean: torch.Tensor,
         labels: torch.Tensor,
@@ -227,12 +233,53 @@ class UNITEAWMLoss(nn.Module):
             "loss/policy": policy_loss.detach(),
             "loss/kl_base": kl_loss.detach(),
             "loss/kl_ema": ema_kl_loss.detach(),
-            "loss/total": loss.detach(),
+            "loss/awm_total": loss.detach(),
             "awm/logprob": logprob.detach().mean(),
             "awm/ratio": ratio.detach().mean(),
             "awm/adv_abs": adv_rep.detach().abs().mean(),
         }
         return loss, metrics
+
+    def _reconstruction_forward(self, images: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        recon_loss, recon_metrics = self.policy.forward_tokenizer(images)
+        metrics = {
+            "loss/recon_total": recon_metrics["recon_total"].detach(),
+            "loss/recon_l1": recon_metrics["rec_loss"].detach(),
+            "loss/recon_lpips": recon_metrics["lpips_loss"].detach(),
+        }
+        return recon_loss, metrics
+
+    def forward(
+        self,
+        z_clean: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        advantages: torch.Tensor | None = None,
+        recon_images: torch.Tensor | None = None,
+        awm_loss_weight: float = 1.0,
+        recon_loss_weight: float = 1.0,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        device = self.policy.latent_tokens.device
+        total_loss = torch.zeros((), device=device)
+        metrics: Dict[str, torch.Tensor] = {}
+
+        if z_clean is not None:
+            if labels is None or advantages is None:
+                raise ValueError("labels and advantages are required when z_clean is provided.")
+            awm_loss, awm_metrics = self._awm_forward(z_clean, labels, advantages)
+            weighted_awm = self.generation_weight * awm_loss_weight * awm_loss
+            total_loss = total_loss + weighted_awm
+            metrics.update(awm_metrics)
+            metrics["loss/awm_weighted"] = weighted_awm.detach()
+
+        if recon_images is not None and self.reconstruction_weight > 0:
+            recon_loss, recon_metrics = self._reconstruction_forward(recon_images)
+            weighted_recon = self.reconstruction_weight * recon_loss_weight * recon_loss
+            total_loss = total_loss + weighted_recon
+            metrics.update(recon_metrics)
+            metrics["loss/recon_weighted"] = weighted_recon.detach()
+
+        metrics["loss/total"] = total_loss.detach()
+        return total_loss, metrics
 
 
 @torch.no_grad()
@@ -383,6 +430,47 @@ def split_loss_indices(num_items: int, num_chunks: int, device: torch.device) ->
         raise ValueError("Cannot split an empty rollout batch.")
     num_chunks = min(max(int(num_chunks), 1), num_items)
     return list(torch.arange(num_items, device=device).chunk(num_chunks))
+
+
+def split_indices_by_micro_batch_size(
+    num_items: int,
+    micro_batch_size: int,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    if num_items <= 0:
+        raise ValueError("Cannot split an empty batch.")
+    if micro_batch_size <= 0:
+        micro_batch_size = num_items
+    indices = torch.arange(num_items, device=device)
+    return [indices[start:start + micro_batch_size] for start in range(0, num_items, micro_batch_size)]
+
+
+class ReconstructionBatcher:
+    def __init__(self, loader: Any, sampler: Any, device: torch.device) -> None:
+        self.loader = loader
+        self.sampler = sampler
+        self.device = device
+        self.epoch = 0
+        self.iterator = iter(loader)
+
+    def next_images(self) -> torch.Tensor:
+        try:
+            images, _labels = next(self.iterator)
+        except StopIteration:
+            self.epoch += 1
+            if self.sampler is not None:
+                self.sampler.set_epoch(self.epoch)
+            self.iterator = iter(self.loader)
+            images, _labels = next(self.iterator)
+        return images.to(self.device, non_blocking=True)
+
+
+def metric_accum_weight(key: str, awm_weight: float, recon_weight: float) -> float:
+    if key in {"loss/total", "loss/awm_weighted", "loss/recon_weighted"}:
+        return 1.0
+    if key.startswith("loss/recon"):
+        return recon_weight
+    return awm_weight
 
 
 def _as_float_list(value: Any, fallback: float) -> list[float]:
@@ -581,6 +669,7 @@ def main() -> None:
     reward_cfg = dict(full_cfg.get("reward", {}))
     sample_cfg = dict(full_cfg.get("sampling", {}))
     eval_cfg = dict(full_cfg.get("eval", {}))
+    reconstruction_cfg = dict(full_cfg.get("reconstruction", {}))
     validate_checkpoint_eval_config(eval_cfg)
 
     seed = int(training_cfg.get("global_seed", 0)) * world_size + rank
@@ -618,13 +707,14 @@ def main() -> None:
     kl_ema_policy = deepcopy(policy).to(device).eval()
     kl_ema_policy.requires_grad_(False)
 
-    awm_module = UNITEAWMLoss(policy, reference, kl_ema_policy, awm_cfg).to(device)
+    awm_module = UNITEAWMLoss(policy, reference, kl_ema_policy, awm_cfg, reconstruction_cfg).to(device)
     if dist.is_initialized():
         ddp_model = DDP(
             awm_module,
             device_ids=[device.index],
             broadcast_buffers=False,
             find_unused_parameters=True,
+            gradient_as_bucket_view=True,
         )
     else:
         ddp_model = awm_module
@@ -662,6 +752,47 @@ def main() -> None:
         dist.barrier()
     else:
         reward_model = DINOv2ImageNetReward(device, **reward_kwargs)
+
+    reconstruction_enabled = bool(reconstruction_cfg.get("enabled", False))
+    reconstruction_batcher = None
+    reconstruction_batch_size = int(reconstruction_cfg.get("batch_size", 64))
+    reconstruction_micro_batch_size = int(
+        reconstruction_cfg.get("micro_batch_size", reconstruction_batch_size)
+    )
+    if reconstruction_enabled:
+        reconstruction_data_path = (
+            args.data_path
+            or reconstruction_cfg.get("data_path")
+            or os.environ.get("DATA_PATH")
+        )
+        if not reconstruction_data_path:
+            raise RuntimeError(
+                "reconstruction.enabled is true, but no data path was provided. "
+                "Set --data-path, reconstruction.data_path, or DATA_PATH."
+            )
+        reconstruction_loader, reconstruction_sampler = prepare_dataloader(
+            reconstruction_data_path,
+            int(reconstruction_cfg.get("image_size", 256)),
+            reconstruction_batch_size,
+            int(reconstruction_cfg.get("num_workers", 4)),
+            rank,
+            world_size,
+            transform_type=int(reconstruction_cfg.get("transform_type", 0)),
+            rrc_scale_min=float(reconstruction_cfg.get("rrc_scale_min", 0.8)),
+            rrc_scale_max=float(reconstruction_cfg.get("rrc_scale_max", 1.0)),
+        )
+        reconstruction_batcher = ReconstructionBatcher(
+            reconstruction_loader,
+            reconstruction_sampler,
+            device,
+        )
+        if rank == 0:
+            log.info(
+                f"[Reconstruction] enabled: data={reconstruction_data_path}, "
+                f"batch/GPU={reconstruction_batch_size}, "
+                f"micro_batch={reconstruction_micro_batch_size}, "
+                f"weight={float(reconstruction_cfg.get('weight', 1.0))}"
+            )
 
     max_train_steps = int(training_cfg.get("max_train_steps", 10000))
     grad_accum_steps = int(training_cfg.get("gradient_accumulation_steps", 1))
@@ -765,22 +896,56 @@ def main() -> None:
         )
 
         raw_module.policy.train()
-        loss_chunks = split_loss_indices(labels.shape[0], grad_accum_steps, device)
-        for accum_idx, idx in enumerate(loss_chunks):
-            weight = idx.numel() / labels.shape[0]
+        awm_chunks = split_loss_indices(labels.shape[0], grad_accum_steps, device)
+        for accum_idx, awm_idx in enumerate(awm_chunks):
+            awm_weight = awm_idx.numel() / labels.shape[0]
             sync_context = (
                 ddp_model.no_sync()
-                if hasattr(ddp_model, "no_sync") and accum_idx < len(loss_chunks) - 1
+                if hasattr(ddp_model, "no_sync") and accum_idx < len(awm_chunks) - 1
                 else torch.enable_grad()
             )
             with sync_context:
                 with autocast(device_type, **autocast_kwargs):
-                    loss, metrics = ddp_model(z_clean[idx], labels[idx], advantages[idx])
-                    loss = loss * weight
+                    loss, metrics = ddp_model(
+                        z_clean=z_clean[awm_idx],
+                        labels=labels[awm_idx],
+                        advantages=advantages[awm_idx],
+                        awm_loss_weight=float(awm_weight),
+                    )
                 loss.backward()
 
             for key, value in metrics.items():
-                metric_sums[key] = metric_sums.get(key, torch.zeros_like(value)) + value * weight
+                metric_weight = metric_accum_weight(key, float(awm_weight), 0.0)
+                metric_sums[key] = metric_sums.get(key, torch.zeros_like(value)) + value * metric_weight
+
+        reconstruction_images = None
+        reconstruction_chunks: list[torch.Tensor] = []
+        if reconstruction_batcher is not None:
+            reconstruction_images = reconstruction_batcher.next_images()
+            reconstruction_chunks = split_indices_by_micro_batch_size(
+                reconstruction_images.shape[0],
+                reconstruction_micro_batch_size,
+                device,
+            )
+        for accum_idx, recon_idx in enumerate(reconstruction_chunks):
+            assert reconstruction_images is not None
+            recon_weight = recon_idx.numel() / reconstruction_images.shape[0]
+            sync_context = (
+                ddp_model.no_sync()
+                if hasattr(ddp_model, "no_sync") and accum_idx < len(reconstruction_chunks) - 1
+                else torch.enable_grad()
+            )
+            with sync_context:
+                with autocast(device_type, **autocast_kwargs):
+                    loss, metrics = ddp_model(
+                        recon_images=reconstruction_images[recon_idx],
+                        recon_loss_weight=float(recon_weight),
+                    )
+                loss.backward()
+
+            for key, value in metrics.items():
+                metric_weight = metric_accum_weight(key, 0.0, float(recon_weight))
+                metric_sums[key] = metric_sums.get(key, torch.zeros_like(value)) + value * metric_weight
 
         if clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(params, clip_grad)
@@ -819,7 +984,10 @@ def main() -> None:
             log_stats = {key: value.item() for key, value in metric_sums.items()}
             log_stats["reward/mean"] = rewards.detach().mean().item()
             log_stats["awm/local_rollout_batch"] = float(local_rollout_batch)
-            log_stats["awm/loss_microbatches"] = float(len(loss_chunks))
+            log_stats["awm/loss_microbatches"] = float(len(awm_chunks))
+            if reconstruction_images is not None:
+                log_stats["recon/batch"] = float(reconstruction_images.shape[0])
+                log_stats["recon/microbatches"] = float(len(reconstruction_chunks))
             log_stats["perf/step_sec"] = time.time() - step_start
             logger.info(
                 f"[Step {global_step}] "
