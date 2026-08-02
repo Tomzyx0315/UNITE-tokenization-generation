@@ -48,10 +48,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    if not any(k.startswith("module.") for k in state_dict):
-        return state_dict
-    return {k.removeprefix("module."): v for k, v in state_dict.items()}
+def _normalize_checkpoint_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    normalized = {}
+    for key, value in state_dict.items():
+        new_key = key.removeprefix("module.")
+        new_key = new_key.replace("._orig_mod.", ".")
+        new_key = new_key.removeprefix("_orig_mod.")
+        normalized[new_key] = value
+    return normalized
 
 
 def load_unite_checkpoint(policy: UNITE, ckpt_path: str, init_from: str = "ema") -> None:
@@ -62,7 +66,8 @@ def load_unite_checkpoint(policy: UNITE, ckpt_path: str, init_from: str = "ema")
         state = checkpoint["model"]
     else:
         state = checkpoint
-    msg = policy.load_state_dict(_strip_module_prefix(state), strict=False)
+
+    msg = policy.load_state_dict(_normalize_checkpoint_keys(state), strict=False)
     if msg.missing_keys or msg.unexpected_keys:
         raise RuntimeError(
             "Checkpoint does not match UNITE architecture: "
@@ -405,12 +410,20 @@ def main() -> None:
         autocast_kwargs = dict(enabled=False)
 
     reward_dtype = torch.float16 if precision == "fp16" else torch.float32
-    reward_model = DINOv2ImageNetReward(
-        device,
+    reward_kwargs = dict(
         model_name=str(reward_cfg.get("model_name", "dinov2_vitl14_lc")),
         dtype=reward_dtype,
         mode=str(reward_cfg.get("mode", "logprob")),
     )
+    if dist.is_initialized():
+        if rank == 0:
+            reward_model = DINOv2ImageNetReward(device, **reward_kwargs)
+        dist.barrier()
+        if rank != 0:
+            reward_model = DINOv2ImageNetReward(device, **reward_kwargs)
+        dist.barrier()
+    else:
+        reward_model = DINOv2ImageNetReward(device, **reward_kwargs)
 
     max_train_steps = int(training_cfg.get("max_train_steps", 10000))
     grad_accum_steps = int(training_cfg.get("gradient_accumulation_steps", 1))
